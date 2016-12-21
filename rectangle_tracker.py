@@ -1,32 +1,40 @@
+# Basic Dependencies
+from __future__ import division
 from operator import itemgetter
 from math import ceil, floor, acos
+from time import time
+
+# External Dependencies
 import numpy as np
 from numpy.linalg import norm
 import cv2
+import matplotlib.pyplot as plt
+# %matplotlib inline  # use when in JUPYTER NOTEBOOK (or risk hang)
+# plt.ion()  # allow ipython %run to terminate without closing figure
 
-video_file_location = 'sample.avi'
-MAX_TIME_DELTA = 0.25  # for trackr
-MIN_TIME_DELTA = 0.05  # for trackr
-max_duration_to_track_in_mhi = 10  # seconds
-frame_width, frame_height = 640, 424
-fps = 24
-rot180 = True  # If paper is upside down, change this
+
+# Default User Parameters
+VIDEO_FILE_LOCATION = 'sample.avi'
+FPS_INTERVAL = 10  # updates FPS estimate after this many frames
+MHI_DURATION = 10  # max frames remembered by motion history
+FRAME_WIDTH, FRAME_HEIGHT = 640, 424
+PAPER_RATIO = 11/8.5  # height/width of paper
+ROT180 = True  # If paper is upside down, change this
+
+
+# Internal Parameters
 tol_corner_movement = 0.1
-obst_tol = 2
+obst_tol = 2   # used to determine tolerance
 
 
-def argmin(somelist):
-    return min(enumerate(somelist), key=itemgetter(1))
-
-
-def rotate180(src):
-    (h, w) = src.shape[:2]
-    center = (w / 2, h / 2)
-    M = cv2.getRotationMatrix2D(center, 180, 1.0)
-    return cv2.warpAffine(src, M, (w, h))
+def rotate180(im):
+    """Rotates an image by 180 degrees."""
+    return cv2.flip(cv2.transpose(im), -1)
 
 
 def persTransform(pts, H):
+    """Transforms a list of points, `pts`,
+    using the perspective transform `H`."""
     src = np.zeros((len(pts), 1, 2))
     src[:, 0] = pts
     dst = cv2.perspectiveTransform(src, H)
@@ -34,77 +42,112 @@ def persTransform(pts, H):
 
 
 def affTransform(pts, A):
+    """Transforms a list of points, `pts`,
+    using the affine transform `A`."""
     src = np.zeros((len(pts), 1, 2))
     src[:, 0] = pts
     dst = cv2.transform(src, A)
     return np.array(dst[:, 0, :], dtype='float32')
 
 
-def unsharpMask(im, win, amt, k=1.5):
-    """Perform in-place unsharp masking operation.
-    win : should be 2-tuple of odd positive integers and amt a scalar"""
-    tmp = cv2.GaussianBlur(im, win, amt)
-    return cv2.addWeighted(im, k, tmp, -0.5, 0)
-
-
-def dimg(im, nodes=None, node_colors=None, dontAlterInputImage=True,
-         polygon=False, title='tmp', pause=False):
-    if dontAlterInputImage:
+def draw_polygon(im, vertices, vertex_colors=None, edge_colors=None,
+                 alter_input_image=False, draw_edges=True, draw_vertices=True,
+                 display=False, title='', pause=False):
+    """returns image with polygon drawn on it."""
+    _default_vertex_color = (255, 0, 0)
+    _default_edge_color = (255, 0, 0)
+    if not alter_input_image:
         im2 = im.copy()
     else:
         im2 = im
-    if nodes is not None:
-        N = len(nodes)
-        tnodes = [tuple(c) for c in nodes]
-        if node_colors is None:
-            node_colors = [(255, 0, 0)] * N
+    if vertices is not None:
+        N = len(vertices)
+        vertices = [tuple(v) for v in vertices]
+        if vertex_colors is None:
+            vertex_colors = [_default_vertex_color] * N
+        if edge_colors is None:
+            edge_colors = [_default_edge_color] * N
         for i in range(N):
-            startpt = tnodes[(i - 1) % N]
-            endpt = tnodes[i]
-            cv2.circle(im2, startpt, 3, node_colors[(i - 1) % N], -1)
-            if polygon:
-                cv2.line(im2, startpt, endpt, (0, 0, 255), 2)
-    cv2.imshow(title, im2)
-    # Note: the `0xFF == ord('q')`is apparently necessary for 64bit machines
-    if pause and cv2.waitKey(0) & 0xFF == ord('q'):
-        pass
+            startpt = vertices[(i - 1) % N]
+            endpt = vertices[i]
+            if draw_vertices:
+                cv2.circle(im2, startpt, 3, vertex_colors[(i - 1) % N], -1)
+            if draw_edges:
+                cv2.line(im2, startpt, endpt, edge_colors[(i - 1) % N], 2)
+    if display:
+        cv2.imshow(title, im2)
+        # Note: `0xFF == ord('q')`is apparently necessary for 64bit machines
+        if pause and cv2.waitKey(0) & 0xFF == ord('q'):
+            pass
+    return im2
+
+
+def display_images(images, num_rows, num_cols, titles=None, figure=None):
+    """Creates and displays a 2-dimensional array of images.
+    If image is not already a 3-tensor, will attempt to convert to BGR.
+    images - must be a list of lists"""
+
+    if figure is None:
+        fig = plt.figure()
+    else:
+        fig = figure
+    for i, row in enumerate(images):
+        for j, img in enumerate(row):
+            try:
+                b, g, r = cv2.split(img)
+                img = cv2.merge([r, g, b])
+            except ValueError:
+                pass
+            subplot_idx = i*num_cols + j + 1
+            subplot = fig.add_subplot(num_rows, num_cols, subplot_idx)
+            if titles:
+                subplot.set_title(titles[i][j])
+            plt.imshow(img)
+            plt.xticks([]), plt.yticks([])  # hide tick marks
+    # plt.draw()
 
 
 def run_main():
+    
     # Initialize some variables
+    fig = plt.figure()
+    frame = None
     old_homog = None
     old_inv_homog = None
-    old_silhouette = None
-    #    segIsGood = False
-    corner_history = []
-    old_dims = []
-    mhi = np.float32(np.zeros((frame_height, frame_width)))
 
-    cap = cv2.VideoCapture(video_file_location)
-    cap.set(cv2.cv.CV_CAP_PROP_FRAME_WIDTH, frame_width)
-    cap.set(cv2.cv.CV_CAP_PROP_FRAME_HEIGHT, frame_height)
+    corner_history = []
+
+    old_silhouette = None
+    old_dims = []
+    mhi = np.float32(np.zeros((FRAME_HEIGHT, FRAME_WIDTH)))
+
+    video_feed = cv2.VideoCapture(VIDEO_FILE_LOCATION)
+    video_feed.set(cv2.cv.CV_CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    video_feed.set(cv2.cv.CV_CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
     frame_count = 0
-    while (True):
+    fps_time = time()
+    while True:
         # initialize some stuff
         c_colors = [(0, 0, 255)] * 4
 
-        # grab current frame from video feed
-        ret, frame = cap.read()
-        roi = frame
+        # grab current frame from video_feed
+        previous_frame = frame
+        _, frame = video_feed.read()
+
+        # Report FPS
         if not (frame_count % 10):
-            print(frame_count)
+            fps = (time() - fps_time)/FPS_INTERVAL
+            print('Frame:', frame_count, ' | FPS:', fps)
+            fps_time = time()
         frame_count += 1
 
-        # make copies and preprocessed versions of the current frame
+        # Convert to grayscale
         try:
-            roi3 = roi.copy()
+            gray_img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         except:
             print("\nVideo feed ended.\n")
             break
-
-        # Convert to grayscale
-        gray_img = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
         # get binary thresholding of image
         smgray_smth = cv2.GaussianBlur(gray_img, (15, 15), 0)
@@ -116,7 +159,7 @@ def run_main():
                                    iterations=4)
 
         # Find corners.  To do this:
-        # 1) Find the largest (area) contour in thresholdeded ,
+        # 1) Find the largest (area) contour in frame (after thresholding)
         # 2) get contours convex hull,
         # 3) reduce degree of convex hull with Douglas-Peucker algorithm,
         # 4) refine corners with subpixel corner finder
@@ -136,12 +179,14 @@ def run_main():
 
         # step 4
         hull = np.float32(hull)
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 1000, 1e-4)
+        method = cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT
+        criteria = (method, 1000, 1e-4)
         cv2.cornerSubPix(gray_img, hull, (5, 5), (-1, -1), criteria)
         corners = [pt[0] for pt in hull]
 
         # Find top-right corner and use to label corners
         # Note: currently corners are in CW order
+        # Note: ordering will be checked below against expected corners
         tr_index = np.argmin(c[0] + c[1] for c in corners)
         tl = corners[tr_index]
         bl = corners[(tr_index - 1) % 4]
@@ -151,34 +196,49 @@ def run_main():
         # reformat and ensure that ordering is as expected below
         corners = np.float32([[c[0], c[1]] for c in [tl, bl, br, tr]])
 
-        # Check whether paper has moved since last from
-        # Important assumptions on paper tracking (used in code block below):
+        # IMPORTANT ASSUMPTIONS on paper tracking (used in code block below):
         # 1) if any one point is stationary from previous frame, then all
         #    are stationary with probability 1.
-        # 2) for now I can assume the paper will only experience movements
-        #    on a solid planar surface, so (w.r.t said plane) each
-        #    transformation should be of the form of a translation of one
-        #    point (known) plus a rotation around that point (must be solved
-        #    by a second point.
+        # 2) if any corners are obstructed, assume the paper is still flat
+        #    against the same plane as it was in the previous frame.
+        #    I.e. the transformation from previous frame to this frame should
+        #    be of the form of a translation and a rotation in said plane.
+        # 3) see code comments for additional assumptions, haha, sorry
+
+        def get_edge_lengths(topl, botl, botr, topr):
+            """ Takes in list of four corners, returns four edge lengths
+            in order top, right, bottom, left."""
+            tbrl = [topr - topl, topr - botr, botr - botl, botl - topl]
+            return [norm(edge) for edge in tbrl]
+
         last_unob_corners = None
         if corner_history:
-            old_corners = corner_history[-1]
 
-            def get_edge_lengths(topl, botl, botr, topr):
-                """ Takes in list of four corners, returns four edge lengths
-                in order top, right, bottom, left."""
-                tbrl = [topr - topl, topr - botr, botr - botl, botl - topl]
-                return [norm(edge) for edge in tbrl]
-
-            # We'll for obstructions by looking for changes in edge lengths
-            new_lengths = get_edge_lengths(*corners)
+            # determine expected corner locations and edge lengths
+            expected_corners = corner_history[-1]
             if last_unob_corners is None:
-                old_lengths = get_edge_lengths(*old_corners)
+                expected_lengths = get_edge_lengths(*expected_corners)
             else:
-                old_lengths = get_edge_lengths(*last_unob_corners)
+                expected_lengths = get_edge_lengths(*last_unob_corners)
 
+            # check ordering
+            def cyclist(lst, k):
+                if k:
+                    return [lst[(i+k)%len(lst)] for i in xrange(len(lst))]
+                return lst
+
+            def _order_dist(offset):
+                offset_corners = corners[cyclist(range(4), offset)]
+                return norm(expected_corners - offset_corners), offset_corners
+            if corner_history:
+                corners = min(_order_dist(k) for k in range(4))[1]
+
+            # Look for obstructions by looking for changes in edge lengths
+            # TODO: checking by Hessian may be a better method
+            new_lengths = get_edge_lengths(*corners)
             top_is_bad, rgt_is_bad, bot_is_bad, lft_is_bad = \
-                [abs(l0 - l1) > obst_tol for l1, l0 in zip(new_lengths, old_lengths)]
+                [abs(l0 - l1) > obst_tol for l1, l0 in
+                                zip(new_lengths, expected_lengths)]
             tl_ob = top_is_bad and lft_is_bad
             bl_ob = bot_is_bad and lft_is_bad
             br_ob = bot_is_bad and rgt_is_bad
@@ -189,139 +249,142 @@ def run_main():
             ob_corner_ct = sum(is_obstr)
             c_colors = [(0, 255, 0) if b else (0, 0, 255) for b in is_obstr]
 
-            # If one of the corners hasn't moved, then just assume none have
-            diffs = [norm(corners[i] - old_corners[i]) for i in range(4)]
-            min_idx, min_diff = argmin(diffs)
-            if min_diff < tol_corner_movement:  # the paper hasn't moved
-                for idx, d in enumerate(diffs):
-                    if d > tol_corner_movement:
-                        corners[idx] = old_corners[idx]
+            # Find difference of corners from expected location
+            diffs = [norm(c - ec) for c, ec in zip(corners, expected_corners)]
+            has_moved = [d > tol_corner_movement for d in diffs]
 
-            else:  # The paper has moved, figure out where to
-                if 0 < ob_corner_ct < 4:
+            # Check if paper has likely moved
+            if not any(has_moved):
+                # assume all is cool, just trust the corners found
+                pass
+            else:
+                if sum(has_moved) == 1:
+
+                    # ### DEBUG (delete me) #######
+                    # import pdb; pdb.set_trace()
+                    # ### end of DEBUG #############
+
+                    # only one corner has moved, just assume it's obstructed
+                    # and replace it with the expected location
+                    bad_corner_idx = np.argmax(diffs)
+                    corners[bad_corner_idx] = expected_corners[bad_corner_idx]
+
+                else:  # find paper's affine transformation in expected plane
                     print("frame={} | ob_corner_ct={}"
                           "".format(frame_count, ob_corner_ct))
 
-                    old_good = np.float32([c for i, c in enumerate(old_corners) if not is_obstr[i]])
-                    old_hidd = np.float32([c for i, c in enumerate(old_corners) if is_obstr[i]])
-                    new_good = np.float32([c for i, c in enumerate(corners) if not is_obstr[i]])
+                    if sum(is_obstr) in (1, 2, 3):
+                        eco = zip(expected_corners, is_obstr)
+                        exp_unob = np.float32([c for c, b in eco if not b])
+                        exp_ob = np.float32([c for c, b in eco if b])
+                        co = zip(corners, is_obstr)
+                        new_unob = np.float32([c for c, b in co if not b])
 
-                    p_old_good = persTransform(old_good, old_homog)
-                    p_old_hidd = persTransform(old_hidd, old_homog)
-                    p_new_good = persTransform(new_good, old_homog)
+                        exp_unob_pp = persTransform(exp_unob, old_homog)
+                        exp_ob_pp = persTransform(exp_ob, old_homog)
+                        new_unob_pp = persTransform(new_unob, old_homog)
 
-                # check for obstructions
-                if ob_corner_ct == 0:  # yay! no obstructed corners!
-                    last_unob_corners = corners
+                        # ### DEBUG (delete me) #######
+                        # import pdb; pdb.set_trace()
+                        # ### end of DEBUG #############
 
-                elif ob_corner_ct == 1:
-                    # Then use old_homog to transform old and new good points,
-                    # then find affine transformation between them and map back
-                    A = cv2.getAffineTransform(p_old_good, p_new_good)
-                    p_new_hidd = affTransform(p_old_hidd, A)
-                    new_hidd = persTransform(p_new_hidd, old_inv_homog)
-                    corners[np.ix_(ob_indices)] = new_hidd
+                    # check for obstructions
+                    if ob_corner_ct == 0:  # yay! no obstructed corners!
+                        last_unob_corners = corners
 
-                elif ob_corner_ct == 2:
-                    # Align the line between the good corners with the same
-                    # line w.r.t the old corners
-                    p1, q1 = p_new_good[0], p_new_good[1]
-                    p0, q0 = p_old_good[0], p_old_good[1]
-                    u0 = (q0 - p0) / norm(q0 - p0)
-                    u1 = (q1 - p1) / norm(q1 - p1)
-                    angle = acos(np.dot(u0, u1))  # unsigned
-                    trans = p1 - p0
+                    elif ob_corner_ct == 1:
+                        # Find the affine transformation in the paper's plane
+                        # from expected locations of the three unobstructed
+                        # corners to the found locations, then use this to
+                        # estimate the obstructed corner's location
+                        A = cv2.getAffineTransform(exp_unob_pp, new_unob_pp)
+                        new_ob_pp = affTransform(exp_ob_pp, A)
+                        new_ob = persTransform(new_ob_pp, old_inv_homog)
+                        corners[np.ix_(ob_indices)] = new_ob
 
-                    # Find rotation that moves u0 to u1
-                    rotat = cv2.getRotationMatrix2D(tuple(p1), angle, 1)[:, :2]
+                    elif ob_corner_ct == 2:
+                        # Align the line between the good corners
+                        # with the same line w.r.t the old corners
+                        p1, q1 = new_unob_pp[0], new_unob_pp[1]
+                        p0, q0 = exp_unob_pp[0], exp_unob_pp[1]
+                        u0 = (q0 - p0) / norm(q0 - p0)
+                        u1 = (q1 - p1) / norm(q1 - p1)
+                        angle = acos(np.dot(u0, u1))  # unsigned
+                        trans = p1 - p0
 
-                    # Expensive sign check for angle (could be improved)
-                    if norm(np.dot(u0, rotat) - u1) > norm(np.dot(u1, rotat) - u0):
-                        rotat = np.linalg.inv(rotat)
+                        # Find rotation that moves u0 to u1
+                        rotat = cv2.getRotationMatrix2D(tuple(p1), angle, 1)
+                        rotat = rotat[:, :2]
 
-                    # transform the old coords of the hidden corners and map
-                    # them back to desk plane
-                    p_old_hidd += trans
-                    p_new_hidd = affTransform(p_old_hidd, rotat)
-                    new_hidd = persTransform(p_new_hidd, old_inv_homog)
-                    corners[np.ix_(ob_indices)] = new_hidd
+                        # Expensive sign check for angle (could be improved)
+                        if norm(np.dot(u0, rotat) - u1) > norm(np.dot(u1, rotat) - u0):
+                            rotat = np.linalg.inv(rotat)
 
-                elif ob_corner_ct == 3:
-                    # Use the one good corner along with the vectors given by
-                    # the paper's edges
-                    p1 = p_new_good[0]
-                    p0 = p_old_good[0]
-                    trans = p1 - p0
-                    print "Andy... you still need to fix me. frame = %s" % frame_count
-                    angle = 0  ###MUST FIX
+                        # transform the old coords of the hidden corners
+                        # and map them back to the paper plane
+                        exp_ob_pp += trans
+                        new_ob_pp = affTransform(exp_ob_pp, rotat)
+                        new_ob = persTransform(new_ob_pp, old_inv_homog)
+                        corners[np.ix_(ob_indices)] = new_ob
 
-                    # Find rotation that moves u0 to u1
-                    rotat = cv2.getRotationMatrix2D(p1, angle, 1)[:, 0:2]
-                    if norm(np.dot(u0, rotat) - u1) > norm(np.dot(u1, rotat) - u0):
-                        rotat = rotat ** (-1)
-
-                    # Create and affine tranformation from `rotat` and `trans`
-                    trans = np.array([trans]).T
-                    A = np.hstack((rotat, trans))
-
-                    # push transform the hidden old corner and map them back
-                    # to desk plane
-                    p_new_hidd = persTransform(p_old_hidd, A)
-                    new_hidd = persTransform(p_new_hidd, old_inv_homog)
-                    corners[np.ix_(ob_indices)] = new_hidd
-
-                elif ob_corner_ct == 4:
-                    # Note: should replace the crappy solution in this
-                    # case with one based on shape matching.
-                    print("Uh oh, all 4 corners obstructed... here's to"
-                          "hoping that paper doesn't move.")
-                    corners = old_corners
-                else:
-                    raise Exception("This should never happen.")
+                    elif ob_corner_ct in (3, 4):
+                        print("Uh oh, {} corners obstructed..."
+                              "".format(ob_corner_ct))
+                        corners = expected_corners
+                    else:
+                        raise Exception("This should never happen.")
 
         # Now that the 4 corners are found:
         # update the mhi, get homographic transform, and display stuff
         w = max(abs(br[0] - bl[0]),
                 abs(tr[0] - tl[0]))  # width of paper in pixels
-        h = 11 * w / 8.5
-        p_corners = np.float32([[0, 0], [0, h], [w, h], [w, 0]])
-        homog, mask = cv2.findHomography(corners, p_corners)
-        inv_homog, inv_mask = cv2.findHomography(p_corners, corners)
-        paper = cv2.warpPerspective(roi, homog, (int(ceil(w)), int(ceil(h))))
-        if rot180:
+        h = PAPER_RATIO * w
+        corners_pp = np.float32([[0, 0], [0, h], [w, h], [w, 0]])
+        homog, mask = cv2.findHomography(corners, corners_pp)
+        inv_homog, inv_mask = cv2.findHomography(corners_pp, corners)
+        paper = cv2.warpPerspective(frame, homog, (int(ceil(w)), int(ceil(h))))
+        if ROT180:
             paper = rotate180(paper)
 
-        p_silhouette = np.ones((int(floor(h)), int(floor(w))), dtype='float32')
-        silhouette = cv2.warpPerspective(p_silhouette, inv_homog,
-                                         (frame_width, frame_height))
-
-        old_dims.append((w, h))
         corner_history.append(corners)
         old_homog = homog
         old_inv_homog = inv_homog
-        if old_silhouette is None:
-            old_silhouette = silhouette
-        sil_mask = cv2.absdiff(old_silhouette, silhouette)
-        sil_mask = np.array(sil_mask, dtype=np.result_type(bin_img))
-        timestamp = float(frame_count) / fps
-        cv2.updateMotionHistory(sil_mask, mhi, timestamp,
-                                max_duration_to_track_in_mhi)
-        old_silhouette = silhouette
 
-        # display histogram of paper
-        #        from andysmod import cv2hist
-        #        cv2hist(paper)
+        # # Update motion history
+        # old_dims.append((w, h))
+        # dims = (int(floor(h)), int(floor(w)))
+        # silhouette_pp = np.ones(dims, dtype='float32')
+        # silhouette = cv2.warpPerspective(silhouette_pp, inv_homog,
+        #                                  (FRAME_WIDTH, FRAME_HEIGHT))
+        # if old_silhouette is None:
+        #     old_silhouette = silhouette
+        # sil_mask = cv2.absdiff(old_silhouette, silhouette)
+        # sil_mask = np.array(sil_mask, dtype=np.result_type(bin_img))
+        # cv2.updateMotionHistory(sil_mask, mhi, frame_count, MHI_DURATION)
+        # old_silhouette = silhouette
 
-        # Display images
-        dimg(roi, corners, node_colors=c_colors, polygon=True,
-             title='paper detected')
-        dimg(paper, title="paper")
+        # Display frame segmentation
+        draw_polygon(frame, corners, c_colors, display=True)
+
+        # Display all key images
+        if False:
+            segmented_frame = draw_polygon(frame, corners, c_colors)
+            images = [[paper, segmented_frame],
+                      [bin_img, closed_bin_img]]
+            titles = [['paper', 'segmented_frame'],
+                      ['post-thresholding', 'post-closing']]
+            display_images(images, 2, 2, titles, figure=fig)
+
+        # # display histogram of paper
+        # if False:
+        #    from andysmod import cv2hist
+        #    cv2hist(paper)
 
         # this is apparently necessary for 64bit machines
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    cap.release()
+    video_feed.release()
     cv2.destroyAllWindows()
 
 
