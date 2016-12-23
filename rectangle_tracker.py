@@ -1,16 +1,21 @@
+"""
+Notes:
+    1) This is algorithm is primarily designed for a rectangular piece of
+        paper lying flat on a flat surface, but may work in other situations
+        assuming that the paper's corners are not obstructed.
+    2) The camera's view of the paper must be unobstructed in first frame.
+
+"""
+
 # Basic Dependencies
 from __future__ import division
-from operator import itemgetter
-from math import ceil, floor, acos
+from math import ceil, acos
 from time import time
 
 # External Dependencies
 import numpy as np
 from numpy.linalg import norm
 import cv2
-import matplotlib.pyplot as plt
-# %matplotlib inline  # use when in JUPYTER NOTEBOOK (or risk hang)
-# plt.ion()  # allow ipython %run to terminate without closing figure
 
 
 # Default User Parameters
@@ -20,12 +25,13 @@ MHI_DURATION = 10  # max frames remembered by motion history
 FRAME_WIDTH, FRAME_HEIGHT = 640, 424
 PAPER_RATIO = 11/8.5  # height/width of paper
 ROT180 = True  # If paper is upside down, change this
+USE_PYPLOT = False
 
 
 # Internal Parameters
-tol_corner_movement = 0.1
-obst_tol = 2   # used to determine tolerance
-
+tol_corner_movement = 1
+obst_tol = 10   # used to determine tolerance
+closing_iterations = 10
 
 def rotate180(im):
     """Rotates an image by 180 degrees."""
@@ -82,44 +88,17 @@ def draw_polygon(im, vertices, vertex_colors=None, edge_colors=None,
     return im2
 
 
-def display_images(images, num_rows, num_cols, titles=None, figure=None):
-    """Creates and displays a 2-dimensional array of images.
-    If image is not already a 3-tensor, will attempt to convert to BGR.
-    images - must be a list of lists"""
-
-    if figure is None:
-        fig = plt.figure()
-    else:
-        fig = figure
-    for i, row in enumerate(images):
-        for j, img in enumerate(row):
-            try:
-                b, g, r = cv2.split(img)
-                img = cv2.merge([r, g, b])
-            except ValueError:
-                pass
-            subplot_idx = i*num_cols + j + 1
-            subplot = fig.add_subplot(num_rows, num_cols, subplot_idx)
-            if titles:
-                subplot.set_title(titles[i][j])
-            plt.imshow(img)
-            plt.xticks([]), plt.yticks([])  # hide tick marks
-    # plt.draw()
-
-
 def run_main():
     
     # Initialize some variables
-    fig = plt.figure()
+    if USE_PYPLOT:
+        import matplotlib.pyplot as plt
+        plt.ion()  # allow ipython %run to terminate without closing figure
+        fig = plt.figure()
     frame = None
     old_homog = None
     old_inv_homog = None
-
     corner_history = []
-
-    old_silhouette = None
-    old_dims = []
-    mhi = np.float32(np.zeros((FRAME_HEIGHT, FRAME_WIDTH)))
 
     video_feed = cv2.VideoCapture(VIDEO_FILE_LOCATION)
     video_feed.set(cv2.cv.CV_CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
@@ -150,13 +129,13 @@ def run_main():
             break
 
         # get binary thresholding of image
-        smgray_smth = cv2.GaussianBlur(gray_img, (15, 15), 0)
-        _, bin_img = cv2.threshold(smgray_smth, 100, 255, cv2.THRESH_BINARY)
+        gray_smooth = cv2.GaussianBlur(gray_img, (15, 15), 0)
+        _, bin_img = cv2.threshold(gray_smooth, 100, 255, cv2.THRESH_BINARY)
 
         # morphological closing
         kernel = np.ones((3, 3), np.uint8)
-        closed_bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, kernel,
-                                   iterations=4)
+        bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE,
+                                   kernel, iterations=closing_iterations)
 
         # Find corners.  To do this:
         # 1) Find the largest (area) contour in frame (after thresholding)
@@ -165,9 +144,8 @@ def run_main():
         # 4) refine corners with subpixel corner finder
 
         # step 1
-        contours, _ = cv2.findContours(closed_bin_img,
-                                       cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL,
+                                                cv2.CHAIN_APPROX_SIMPLE)
         biggest_contour = max(contours, key=cv2.contourArea)
 
         # step 2
@@ -211,11 +189,11 @@ def run_main():
             tbrl = [topr - topl, topr - botr, botr - botl, botl - topl]
             return [norm(edge) for edge in tbrl]
 
-        last_unob_corners = None
-        if corner_history:
-
+        if not corner_history:
+            last_unob_corners = corners
+        else:
             # determine expected corner locations and edge lengths
-            expected_corners = corner_history[-1]
+            expected_corners = last_unob_corners
             if last_unob_corners is None:
                 expected_lengths = get_edge_lengths(*expected_corners)
             else:
@@ -234,6 +212,7 @@ def run_main():
                 corners = min(_order_dist(k) for k in range(4))[1]
 
             # Look for obstructions by looking for changes in edge lengths
+            # Note: these lengths are not perspective invariant
             # TODO: checking by Hessian may be a better method
             new_lengths = get_edge_lengths(*corners)
             top_is_bad, rgt_is_bad, bot_is_bad, lft_is_bad = \
@@ -254,16 +233,12 @@ def run_main():
             has_moved = [d > tol_corner_movement for d in diffs]
 
             # Check if paper has likely moved
-            if not any(has_moved):
+            if sum(has_moved) < 4:
                 # assume all is cool, just trust the corners found
+                corners = last_unob_corners
                 pass
             else:
                 if sum(has_moved) == 1:
-
-                    # ### DEBUG (delete me) #######
-                    # import pdb; pdb.set_trace()
-                    # ### end of DEBUG #############
-
                     # only one corner has moved, just assume it's obstructed
                     # and replace it with the expected location
                     bad_corner_idx = np.argmax(diffs)
@@ -284,15 +259,11 @@ def run_main():
                         exp_ob_pp = persTransform(exp_ob, old_homog)
                         new_unob_pp = persTransform(new_unob, old_homog)
 
-                        # ### DEBUG (delete me) #######
-                        # import pdb; pdb.set_trace()
-                        # ### end of DEBUG #############
-
                     # check for obstructions
-                    if ob_corner_ct == 0:  # yay! no obstructed corners!
-                        last_unob_corners = corners
+                    if sum(is_obstr) == 0:  # yay! no obstructed corners!
+                        pass
 
-                    elif ob_corner_ct == 1:
+                    elif sum(is_obstr) == 1:
                         # Find the affine transformation in the paper's plane
                         # from expected locations of the three unobstructed
                         # corners to the found locations, then use this to
@@ -302,7 +273,7 @@ def run_main():
                         new_ob = persTransform(new_ob_pp, old_inv_homog)
                         corners[np.ix_(ob_indices)] = new_ob
 
-                    elif ob_corner_ct == 2:
+                    elif sum(is_obstr) == 2:
                         # Align the line between the good corners
                         # with the same line w.r.t the old corners
                         p1, q1 = new_unob_pp[0], new_unob_pp[1]
@@ -327,15 +298,15 @@ def run_main():
                         new_ob = persTransform(new_ob_pp, old_inv_homog)
                         corners[np.ix_(ob_indices)] = new_ob
 
-                    elif ob_corner_ct in (3, 4):
+                    elif sum(is_obstr) in (3, 4):
                         print("Uh oh, {} corners obstructed..."
                               "".format(ob_corner_ct))
                         corners = expected_corners
                     else:
                         raise Exception("This should never happen.")
 
-        # Now that the 4 corners are found:
-        # update the mhi, get homographic transform, and display stuff
+
+        # Homography
         w = max(abs(br[0] - bl[0]),
                 abs(tr[0] - tl[0]))  # width of paper in pixels
         h = PAPER_RATIO * w
@@ -346,39 +317,21 @@ def run_main():
         if ROT180:
             paper = rotate180(paper)
 
+
+        # Draw detected paper boundary on frame
+        segmented_frame = draw_polygon(frame, corners, c_colors)
+
+        # Display
+        bin_img = cv2.cvtColor(bin_img, cv2.COLOR_GRAY2BGR)
+        both = np.hstack((segmented_frame, bin_img))
+        cv2.imshow('Hello', both)
+
+
+        # Updates for next iteration
         corner_history.append(corners)
         old_homog = homog
         old_inv_homog = inv_homog
 
-        # # Update motion history
-        # old_dims.append((w, h))
-        # dims = (int(floor(h)), int(floor(w)))
-        # silhouette_pp = np.ones(dims, dtype='float32')
-        # silhouette = cv2.warpPerspective(silhouette_pp, inv_homog,
-        #                                  (FRAME_WIDTH, FRAME_HEIGHT))
-        # if old_silhouette is None:
-        #     old_silhouette = silhouette
-        # sil_mask = cv2.absdiff(old_silhouette, silhouette)
-        # sil_mask = np.array(sil_mask, dtype=np.result_type(bin_img))
-        # cv2.updateMotionHistory(sil_mask, mhi, frame_count, MHI_DURATION)
-        # old_silhouette = silhouette
-
-        # Display frame segmentation
-        draw_polygon(frame, corners, c_colors, display=True)
-
-        # Display all key images
-        if False:
-            segmented_frame = draw_polygon(frame, corners, c_colors)
-            images = [[paper, segmented_frame],
-                      [bin_img, closed_bin_img]]
-            titles = [['paper', 'segmented_frame'],
-                      ['post-thresholding', 'post-closing']]
-            display_images(images, 2, 2, titles, figure=fig)
-
-        # # display histogram of paper
-        # if False:
-        #    from andysmod import cv2hist
-        #    cv2hist(paper)
 
         # this is apparently necessary for 64bit machines
         if cv2.waitKey(1) & 0xFF == ord('q'):
