@@ -8,7 +8,7 @@ Notes:
 """
 
 # Basic Dependencies
-from __future__ import division
+from __future__ import division, print_function
 from math import ceil, acos
 from time import time
 
@@ -113,7 +113,7 @@ def run_main():
 
         # Report FPS
         if not (frame_count % 10):
-            fps = (time() - fps_time)/FPS_INTERVAL
+            fps = FPS_INTERVAL/(time() - fps_time)
             print('Frame:', frame_count, ' | FPS:', fps)
             fps_time = time()
         frame_count += 1
