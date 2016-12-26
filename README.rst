@@ -1,5 +1,5 @@
-rectangle_tracker
-=================
+Python/OpenCV Rectangle Tracker
+===============================
 
 Designed to track a piece of letter-size printer paper while it's being written on.  Uses python 2, numpy, and opencv.
 
