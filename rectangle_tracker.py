@@ -24,18 +24,19 @@ FPS_INTERVAL = 10  # updates FPS estimate after this many frames
 MHI_DURATION = 10  # max frames remembered by motion history
 FRAME_WIDTH, FRAME_HEIGHT = 640, 424
 PAPER_RATIO = 11/8.5  # height/width of paper
-ROT180 = True  # If paper is upside down, change this
-USE_PYPLOT = False
+ROT180 = False  # If paper is upside down, change this
+REDUCE_DISPLAY_SIZE = False  # Use if output window is too big for your screen
 
 
 # Internal Parameters
 tol_corner_movement = 1
 obst_tol = 10   # used to determine tolerance
 closing_iterations = 10
+show_thresholding = False  # Use to display thresholding
 
 def rotate180(im):
     """Rotates an image by 180 degrees."""
-    return cv2.flip(cv2.transpose(im), -1)
+    return cv2.flip(im, -1)
 
 
 def persTransform(pts, H):
@@ -91,10 +92,6 @@ def draw_polygon(im, vertices, vertex_colors=None, edge_colors=None,
 def run_main():
     
     # Initialize some variables
-    if USE_PYPLOT:
-        import matplotlib.pyplot as plt
-        plt.ion()  # allow ipython %run to terminate without closing figure
-        fig = plt.figure()
     frame = None
     old_homog = None
     old_inv_homog = None
@@ -321,10 +318,20 @@ def run_main():
         # Draw detected paper boundary on frame
         segmented_frame = draw_polygon(frame, corners, c_colors)
 
+        # Resize paper to simplify display
+        h = segmented_frame.shape[0]
+        paper_w = int(round(h*paper.shape[1]/paper.shape[0]))
+        resized_paper = cv2.resize(paper, (paper_w, h))
+
         # Display
-        bin_img = cv2.cvtColor(bin_img, cv2.COLOR_GRAY2BGR)
-        both = np.hstack((segmented_frame, bin_img))
-        cv2.imshow('Hello', both)
+        big_img = np.hstack((segmented_frame, resized_paper))
+        if show_thresholding:
+            bin_img = cv2.cvtColor(bin_img, cv2.COLOR_GRAY2BGR)
+            big_img = np.hstack((big_img, bin_img))
+        if REDUCE_DISPLAY_SIZE:
+            reduced_size = tuple(np.array(big_img.shape[:2][::-1])//2)
+            smaller_big_img = cv2.resize(big_img, reduced_size)
+        cv2.imshow('', big_img)
 
 
         # Updates for next iteration
